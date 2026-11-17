@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from collections import Counter
 import os
 import re
 import subprocess
@@ -104,6 +105,7 @@ class Telemetry:
     color_md: str | None
     focal_len: str | None
     dzoom_ratio: str | None
+    dzoom_delta: int | None
     raw: str
 
 
@@ -156,6 +158,7 @@ def parse_srt(path: Path) -> list[Telemetry]:
         altitude = maybe_float("altitude")
         if altitude is None:
             altitude = abs_alt if abs_alt is not None else rel_alt
+        dzoom_value, dzoom_delta = parse_dzoom(fields.get("dzoom_ratio"))
 
         records.append(
             Telemetry(
@@ -175,7 +178,8 @@ def parse_srt(path: Path) -> list[Telemetry]:
                 ct=fields.get("ct"),
                 color_md=fields.get("color_md"),
                 focal_len=fields.get("focal_len"),
-                dzoom_ratio=fields.get("dzoom_ratio"),
+                dzoom_ratio=None if dzoom_value is None else str(dzoom_value),
+                dzoom_delta=dzoom_delta,
                 raw=re.sub(r"</?font[^>]*>", "", body).strip(),
             )
         )
@@ -185,17 +189,66 @@ def parse_srt(path: Path) -> list[Telemetry]:
     return records
 
 
-def nearest_telemetry(records: list[Telemetry], t: float) -> Telemetry:
+def parse_dzoom(value: str | None) -> tuple[int | None, int | None]:
+    """DJI writes ``[dzoom_ratio: 10000, delta:0]``. 10000 means 1.00x."""
+    if not value:
+        return None, None
+    ratio_match = re.search(r"\d+", value)
+    delta_match = re.search(r"delta\s*:\s*(-?\d+)", value)
+    ratio = int(ratio_match.group(0)) if ratio_match else None
+    delta = int(delta_match.group(1)) if delta_match else None
+    return ratio, delta
+
+
+def nearest_telemetry_index(records: list[Telemetry], t: float) -> int:
+    best_i = 0
     best = records[0]
     best_dist = abs((best.start_sec + best.end_sec) / 2 - t)
-    for rec in records:
+    for i, rec in enumerate(records):
         if rec.start_sec <= t < rec.end_sec:
-            return rec
+            return i
         dist = min(abs(rec.start_sec - t), abs(rec.end_sec - t))
         if dist < best_dist:
-            best = rec
+            best_i = i
             best_dist = dist
-    return best
+    return best_i
+
+
+def nearest_telemetry(records: list[Telemetry], t: float) -> Telemetry:
+    return records[nearest_telemetry_index(records, t)]
+
+
+def zoom_is_changing(records: list[Telemetry], index: int) -> bool:
+    """True when this instant is mid-zoom and must not enter aerial triangulation."""
+    rec = records[index]
+    if rec.dzoom_delta is not None:
+        return rec.dzoom_delta != 0
+    ratio = int(rec.dzoom_ratio) if rec.dzoom_ratio and rec.dzoom_ratio.isdigit() else None
+    focal = rec.focal_len
+    if ratio is None and focal is None:
+        return False
+    for neighbor in (index - 1, index + 1):
+        if neighbor < 0 or neighbor >= len(records):
+            continue
+        other = records[neighbor]
+        other_ratio = int(other.dzoom_ratio) if other.dzoom_ratio and other.dzoom_ratio.isdigit() else None
+        if ratio is not None and other_ratio is not None and other_ratio != ratio:
+            return True
+        if focal and other.focal_len and other.focal_len != focal:
+            return True
+    return False
+
+
+def effective_focal_mm(rec: Telemetry) -> float | None:
+    base = dji_focal_mm(rec.focal_len)
+    if base is None:
+        return None
+    if not rec.dzoom_ratio or not rec.dzoom_ratio.isdigit():
+        return base
+    ratio = int(rec.dzoom_ratio)
+    if ratio <= 0:
+        return base
+    return base * (ratio / 10000.0)
 
 
 def find_ffmpeg() -> str:
@@ -453,6 +506,7 @@ def write_exif(image_path: Path, rec: Telemetry, video_time: float) -> None:
         shutter=rec.shutter,
         fnum=rec.fnum,
         focal_len=rec.focal_len,
+        focal_mm=effective_focal_mm(rec),
     )
 
 
@@ -467,6 +521,7 @@ def write_clean_exif(
     shutter: str | None = None,
     fnum: str | None = None,
     focal_len: str | None = None,
+    focal_mm: float | None = None,
 ) -> None:
     """Write a conservative EXIF block that photogrammetry viewers can parse."""
     zeroth: dict = {
@@ -515,9 +570,10 @@ def write_clean_exif(
     fnumber = dji_fnumber(fnum)
     if fnumber:
         exif[piexif.ExifIFD.FNumber] = to_rational(fnumber, 100)
-    focal = dji_focal_mm(focal_len)
+    focal = focal_mm if focal_mm is not None else dji_focal_mm(focal_len)
     if focal:
         exif[piexif.ExifIFD.FocalLength] = to_rational(focal, 100)
+        exif[piexif.ExifIFD.FocalLengthIn35mmFilm] = int(round(focal))
 
     piexif.insert(piexif.dump({"0th": zeroth, "Exif": exif, "GPS": gps}), str(image_path))
 
@@ -550,7 +606,14 @@ def read_gps(image_path: Path) -> dict:
         result["longitude"] = sign * dms_to_deg(lon)
     if alt:
         result["altitude"] = alt[0] / alt[1]
-    dt = (data.get("Exif") or {}).get(piexif.ExifIFD.DateTimeOriginal)
+    exif = data.get("Exif") or {}
+    focal = exif.get(piexif.ExifIFD.FocalLength)
+    if focal and focal[1]:
+        result["focal_mm"] = focal[0] / focal[1]
+    focal_35 = exif.get(piexif.ExifIFD.FocalLengthIn35mmFilm)
+    if focal_35 is not None:
+        result["focal_35mm"] = focal_35
+    dt = exif.get(piexif.ExifIFD.DateTimeOriginal)
     if dt:
         result["datetime"] = dt.decode() if isinstance(dt, bytes) else dt
     return result
@@ -619,23 +682,48 @@ def process_pair(
         emit(f"已停止抽帧 {video.name}，已导出 {len(images)} 张，正在写入 GPS", log)
     rows = []
     dests: list[Path] = []
+    dropped_times: list[float] = []
     for i, image in enumerate(images):
         t = i * interval
-        rec = nearest_telemetry(records, t)
+        rec_i = nearest_telemetry_index(records, t)
+        rec = records[rec_i]
+        if zoom_is_changing(records, rec_i):
+            image.unlink(missing_ok=True)
+            dropped_times.append(round(t, 3))
+            continue
         dest = out_dir / f"{video.stem}_{i:04d}.jpg"
         image.rename(dest)
         if overlay and not stopped(cancel):
             draw_overlay(dest, rec, t)
         normalize_jpeg(dest)
         write_exif(dest, rec, t)
+        focal_mm = effective_focal_mm(rec)
         dests.append(dest)
-        rows.append(
-            {
-                "file": dest.name,
-                "video_time_sec": round(t, 3),
-                **{k: v for k, v in asdict(rec).items() if k != "raw"},
-            }
-        )
+        row = {
+            "file": dest.name,
+            "video_time_sec": round(t, 3),
+            "effective_focal_mm": None if focal_mm is None else round(focal_mm, 3),
+            "zoom_x": None if not rec.dzoom_ratio else round(int(rec.dzoom_ratio) / 10000.0, 4),
+        }
+        row.update({k: v for k, v in asdict(rec).items() if k != "raw"})
+        rows.append(row)
+
+    if len({row["zoom_x"] for row in rows}) > 1:
+        counts = Counter(row["zoom_x"] for row in rows)
+        lone = {zoom for zoom, count in counts.items() if count < 2}
+        if lone:
+            kept_rows = []
+            kept_dests = []
+            for row, dest in zip(rows, dests):
+                if row["zoom_x"] in lone:
+                    dest.unlink(missing_ok=True)
+                    dropped_times.append(row["video_time_sec"])
+                    continue
+                kept_rows.append(row)
+                kept_dests.append(dest)
+            rows = kept_rows
+            dests = kept_dests
+            dropped_times.sort()
 
     csv_path = out_dir / f"{video.stem}_frames.csv"
     gpx_path = out_dir / f"{video.stem}.gpx"
@@ -672,6 +760,8 @@ def process_pair(
         "srt_records": len(records),
         "duration_sec": round(records[-1].end_sec, 3),
         "extracted": len(rows),
+        "dropped_zoom": len(dropped_times),
+        "dropped_zoom_sec": dropped_times,
         "gps_written": gps_ok,
         "csv": str(csv_path),
         "gpx": str(gpx_path) if export_gpx else None,
@@ -679,8 +769,8 @@ def process_pair(
     }
     status = "已停止" if stopped(cancel) else "完成"
     emit(
-        f"{status} {video.name}: {len(rows)} 张, GPS {gps_ok}/{len(rows)}, "
-        f"SRT {len(records)} 条, 时长 {records[-1].end_sec:.1f}s",
+        f"{status} {video.name}: 保留 {len(rows)} 张, 变焦过程剔除 {len(dropped_times)} 张, "
+        f"GPS {gps_ok}/{len(rows)}, SRT {len(records)} 条, 时长 {records[-1].end_sec:.1f}s",
         log,
     )
     return summary
@@ -694,6 +784,7 @@ def run_batch(
     only: str | None = None,
     overlay: bool = False,
     export_gpx: bool = True,
+    videos: list[Path] | None = None,
     log=None,
     cancel=None,
 ) -> list[dict]:
@@ -702,6 +793,9 @@ def run_batch(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pairs = find_pairs(input_dir, only, log=log)
+    if videos is not None:
+        wanted = {path.resolve() for path in videos}
+        pairs = [(video, srt) for video, srt in pairs if video.resolve() in wanted]
     if not pairs:
         raise FileNotFoundError("没有找到 MP4/MOV + 同名 SRT 配对文件")
 

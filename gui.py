@@ -19,8 +19,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("视频字幕抽帧")
-        self.geometry("820x640")
-        self.minsize(720, 540)
+        self.geometry("820x760")
+        self.minsize(720, 640)
 
         self.input_var = tk.StringVar(value=str(ROOT))
         self.output_var = tk.StringVar(value=str(ROOT / "output"))
@@ -29,6 +29,9 @@ class App(tk.Tk):
         self.overlay_var = tk.BooleanVar(value=False)
         self.gpx_var = tk.BooleanVar(value=True)
         self.pair_var = tk.StringVar(value="尚未扫描")
+        self.pairs: list[tuple[Path, Path]] = []
+        self.pair_vars: dict[str, tk.BooleanVar] = {}
+        self.pair_anchor: int | None = None
         self.busy = False
         self.cancel = threading.Event()
 
@@ -46,7 +49,7 @@ class App(tk.Tk):
 
         ttk.Label(
             frm,
-            text="把 MP4/MOV 和同名 SRT 按间隔导出成 JPEG，并把字幕里的 GPS 写入图片。",
+            text="把 MP4/MOV 和同名 SRT 按间隔导出成 JPEG，写入 GPS。变焦过程中的帧会剔除，停住的倍率按等效焦距写入。",
             wraplength=760,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
@@ -54,21 +57,46 @@ class App(tk.Tk):
         ttk.Entry(frm, textvariable=self.input_var).grid(row=1, column=1, sticky="ew", **pad)
         ttk.Button(frm, text="浏览", command=self._pick_input).grid(row=1, column=2)
 
-        ttk.Label(frm, text="配对结果").grid(row=2, column=0, sticky="w")
-        ttk.Label(frm, textvariable=self.pair_var).grid(row=2, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Label(frm, text="选择视频").grid(row=2, column=0, sticky="nw")
+        pair_head = ttk.Frame(frm)
+        pair_head.grid(row=2, column=1, columnspan=2, sticky="ew", **pad)
+        ttk.Label(pair_head, textvariable=self.pair_var).pack(side="left")
+        ttk.Button(pair_head, text="全选", command=lambda: self._set_all_pairs(True)).pack(side="left", padx=(12, 4))
+        ttk.Button(pair_head, text="全不选", command=lambda: self._set_all_pairs(False)).pack(side="left")
 
-        ttk.Label(frm, text="输出目录").grid(row=3, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.output_var).grid(row=3, column=1, sticky="ew", **pad)
-        ttk.Button(frm, text="浏览", command=self._pick_output).grid(row=3, column=2)
+        pair_wrap = ttk.Frame(frm)
+        pair_wrap.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=(0, 0), pady=(0, 6))
+        pair_wrap.columnconfigure(0, weight=1)
+        pair_wrap.rowconfigure(0, weight=1)
+        self.pair_canvas = tk.Canvas(pair_wrap, height=150, highlightthickness=0)
+        pair_scroll = ttk.Scrollbar(pair_wrap, command=self.pair_canvas.yview)
+        self.pair_box = ttk.Frame(self.pair_canvas)
+        self.pair_box.bind(
+            "<Configure>",
+            lambda _event: self.pair_canvas.configure(scrollregion=self.pair_canvas.bbox("all")),
+        )
+        self.pair_window = self.pair_canvas.create_window((0, 0), window=self.pair_box, anchor="nw")
+        self.pair_canvas.configure(yscrollcommand=pair_scroll.set)
+        self.pair_canvas.bind(
+            "<Configure>",
+            lambda event: self.pair_canvas.itemconfigure(self.pair_window, width=event.width),
+        )
+        self.pair_canvas.grid(row=0, column=0, sticky="nsew")
+        pair_scroll.grid(row=0, column=1, sticky="ns")
+        frm.rowconfigure(3, weight=1)
 
-        ttk.Label(frm, text="抽帧间隔（秒）").grid(row=4, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.interval_var, width=10).grid(row=4, column=1, sticky="w", **pad)
+        ttk.Label(frm, text="输出目录").grid(row=4, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.output_var).grid(row=4, column=1, sticky="ew", **pad)
+        ttk.Button(frm, text="浏览", command=self._pick_output).grid(row=4, column=2)
 
-        ttk.Label(frm, text="试跑秒数（留空=全部）").grid(row=5, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.trial_var, width=10).grid(row=5, column=1, sticky="w", **pad)
+        ttk.Label(frm, text="抽帧间隔（秒）").grid(row=5, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.interval_var, width=10).grid(row=5, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="试跑秒数（留空=全部）").grid(row=6, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.trial_var, width=10).grid(row=6, column=1, sticky="w", **pad)
 
         opts = ttk.Frame(frm)
-        opts.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 8))
+        opts.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 8))
         ttk.Checkbutton(
             opts,
             text="画面叠加 GPS（仅查看；导入 iTwin / Postshot 请勿勾选）",
@@ -77,7 +105,7 @@ class App(tk.Tk):
         ttk.Checkbutton(opts, text="导出 GPX 航迹", variable=self.gpx_var).pack(side="left")
 
         btns = ttk.Frame(frm)
-        btns.grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        btns.grid(row=8, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self.start_btn = ttk.Button(btns, text="开始抽帧", command=self._start)
         self.start_btn.pack(side="left")
         self.stop_btn = ttk.Button(btns, text="停止", command=self._stop, state="disabled")
@@ -87,12 +115,12 @@ class App(tk.Tk):
         self.repair_btn.pack(side="left", padx=8)
         ttk.Button(btns, text="打开输出目录", command=self._open_output).pack(side="left")
 
-        ttk.Label(frm, text="日志").grid(row=8, column=0, sticky="nw")
-        self.log_box = tk.Text(frm, height=18, wrap="word")
-        self.log_box.grid(row=9, column=0, columnspan=3, sticky="nsew")
-        frm.rowconfigure(9, weight=1)
+        ttk.Label(frm, text="日志").grid(row=9, column=0, sticky="nw")
+        self.log_box = tk.Text(frm, height=10, wrap="word")
+        self.log_box.grid(row=10, column=0, columnspan=3, sticky="nsew")
+        frm.rowconfigure(10, weight=1)
         scroll = ttk.Scrollbar(frm, command=self.log_box.yview)
-        scroll.grid(row=9, column=3, sticky="ns")
+        scroll.grid(row=10, column=3, sticky="ns")
         self.log_box.configure(yscrollcommand=scroll.set)
 
     def _pick_input(self) -> None:
@@ -125,6 +153,12 @@ class App(tk.Tk):
 
     def _scan_pairs(self) -> None:
         input_dir = Path(self.input_var.get().strip() or ROOT)
+        previous = {key: var.get() for key, var in self.pair_vars.items()}
+        for child in self.pair_box.winfo_children():
+            child.destroy()
+        self.pairs = []
+        self.pair_vars = {}
+        self.pair_anchor = None
         if not input_dir.exists():
             self.pair_var.set("目录不存在")
             return
@@ -136,9 +170,47 @@ class App(tk.Tk):
         if not pairs:
             self.pair_var.set("没有找到 MP4/MOV + 同名 SRT")
             return
-        names = "、".join(video.stem for video, _ in pairs[:8])
-        extra = f" 等 {len(pairs)} 组" if len(pairs) > 8 else f"，共 {len(pairs)} 组"
-        self.pair_var.set(names + extra)
+        self.pairs = pairs
+        for index, (video, _srt) in enumerate(pairs):
+            key = str(video.resolve())
+            var = tk.BooleanVar(value=previous.get(key, False))
+            var.trace_add("write", lambda *_args: self._refresh_pair_count())
+            self.pair_vars[key] = var
+            try:
+                label = str(video.resolve().relative_to(input_dir.resolve()))
+            except ValueError:
+                label = video.name
+            button = ttk.Checkbutton(self.pair_box, text=label, variable=var)
+            button.pack(anchor="w", fill="x")
+            button.bind("<Button-1>", lambda event, index=index: self._on_pair_click(event, index))
+        self._refresh_pair_count()
+
+    def _on_pair_click(self, event, index: int):
+        if event.state & 0x0001 and self.pair_anchor is not None:
+            start, end = sorted((self.pair_anchor, index))
+            for video, _srt in self.pairs[start : end + 1]:
+                var = self.pair_vars.get(str(video.resolve()))
+                if var is not None:
+                    var.set(True)
+            return "break"
+        self.pair_anchor = index
+
+    def _set_all_pairs(self, selected: bool) -> None:
+        for var in self.pair_vars.values():
+            var.set(selected)
+
+    def _selected_videos(self) -> list[Path]:
+        chosen = []
+        for video, _srt in self.pairs:
+            var = self.pair_vars.get(str(video.resolve()))
+            if var is not None and var.get():
+                chosen.append(video)
+        return chosen
+
+    def _refresh_pair_count(self) -> None:
+        total = len(self.pairs)
+        selected = len(self._selected_videos())
+        self.pair_var.set(f"已配对 {total} 个，已选 {selected} 个。按住 Shift 可从上次点击连选。")
 
     def _parse_common(self) -> tuple[Path, Path, float, float | None] | None:
         try:
@@ -174,9 +246,14 @@ class App(tk.Tk):
         if parsed is None:
             return
         input_dir, output_dir, interval, max_duration = parsed
+        selected = self._selected_videos()
+        if not selected:
+            messagebox.showerror("未选择视频", "请先勾选要抽帧的视频。")
+            return
 
         self._set_busy(True)
-        self._append_log("开始抽帧...")
+        names = "、".join(path.name for path in selected)
+        self._append_log(f"开始抽帧: {names}")
 
         def work() -> None:
             try:
@@ -187,16 +264,19 @@ class App(tk.Tk):
                     max_duration=max_duration,
                     overlay=self.overlay_var.get(),
                     export_gpx=self.gpx_var.get(),
+                    videos=selected,
                     log=lambda msg: self.after(0, self._append_log, msg),
                     cancel=self.cancel,
                 )
                 total = sum(item["extracted"] for item in summaries)
                 gps_ok = sum(item["gps_written"] for item in summaries)
+                dropped = sum(item.get("dropped_zoom", 0) for item in summaries)
                 halted = self.cancel.is_set()
                 title = "已停止" if halted else "完成"
                 text = (
                     f"{'已停止。' if halted else ''}"
                     f"共处理 {len(summaries)} 段视频，输出 {total} 张图片\n"
+                    f"变焦过程中剔除：{dropped} 张\n"
                     f"已写入 GPS：{gps_ok}/{total}\n{output_dir}"
                 )
                 self.after(0, lambda: self._notify("info", title, text))
